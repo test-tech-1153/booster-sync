@@ -1,0 +1,12 @@
+{
+  "name": "monovault-booster-sync",
+  "private": true,
+  "description": "Syncs Discord server boosters to the Overgrowth Roblox supporter wall.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "sync": "node src/sync.js",
+    "check": "node --check src/sync.js"
+  }
+}
