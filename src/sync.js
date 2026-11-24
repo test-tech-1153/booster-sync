@@ -3,9 +3,9 @@
 /**
  * Monovault booster sync
  *
- * Reads Discord boosters in the live guild, looks up each linked Roblox
- * account through Bloxlink, and writes the list to a Roblox datastore
- * when it has changed.
+ * Reads Discord boosters and server roles in the live guild, looks up each
+ * linked Roblox account through Bloxlink, and writes the lists to a Roblox
+ * datastore when they have changed.
  *
  * Secrets come from the environment. This script never prints them.
  */
@@ -16,8 +16,15 @@ const BLOXLINK_API = "https://api.blox.link/v4/public";
 const ROBLOX_API = "https://apis.roblox.com/cloud/v2";
 const DATASTORE_NAME = "SupporterWall";
 const BOOSTERS_KEY = "boosters";
+const ROLES_KEY = "roles";
 const CACHE_KEY = "lookup-cache";
 const USER_AGENT = "MonovaultBoosterSync/1.0";
+// Unlinked Discord accounts are remembered so the next runs do not call Bloxlink again.
+const NEGATIVE_LOOKUP_TTL_MS = 24 * 60 * 60 * 1000;
+// Pause between Bloxlink lookups. 429 responses still back off further.
+const LOOKUP_GAP_MS = 200;
+// Roblox datastore values cannot exceed 4 MiB. Refuse to write past this.
+const DATASTORE_VALUE_LIMIT_BYTES = 4 * 1024 * 1024;
 
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN || "";
 const BLOXLINK_API_KEY = process.env.BLOXLINK_API_KEY || "";
@@ -145,7 +152,8 @@ async function request(url, options = {}, { attempts = 5, label = "request" } = 
   throw lastError || new Error(`${label} failed after retries`);
 }
 
-async function listDiscordBoosters() {
+async function listDiscordGuild() {
+  const members = [];
   const boosters = [];
   let after = null;
   let page = 0;
@@ -188,23 +196,26 @@ async function listDiscordBoosters() {
       fail("Discord member list returned an unexpected response.");
     }
 
-    const members = body.json;
+    const pageMembers = body.json;
     page += 1;
-    totalMembers += members.length;
+    totalMembers += pageMembers.length;
 
-    for (const member of members) {
+    for (const member of pageMembers) {
       const user = member && member.user;
       if (!user || !user.id) continue;
       if (user.bot) continue;
+      const discordId = String(user.id);
+      const roleIds = Array.isArray(member.roles) ? member.roles.map((id) => String(id)) : [];
+      members.push({ discordId, roleIds });
       if (!member.premium_since) continue;
       boosters.push({
-        discordId: String(user.id),
+        discordId,
         since: String(member.premium_since),
       });
     }
 
-    if (members.length < 1000) break;
-    const last = members[members.length - 1];
+    if (pageMembers.length < 1000) break;
+    const last = pageMembers[pageMembers.length - 1];
     const lastId = last && last.user && last.user.id;
     if (!lastId || lastId === after) {
       fail("Discord member list pagination did not advance. Stopping to avoid a loop.");
@@ -213,7 +224,72 @@ async function listDiscordBoosters() {
   }
 
   log(`Discord: ${totalMembers} member${totalMembers === 1 ? "" : "s"} across ${page} page${page === 1 ? "" : "s"}, ${boosters.length} booster${boosters.length === 1 ? "" : "s"}.`);
-  return boosters;
+  return { members, boosters };
+}
+
+function colorToHex(color) {
+  let n = Number(color);
+  if (!Number.isFinite(n) || n <= 0) n = 0;
+  n = Math.min(0xffffff, Math.trunc(n));
+  return `#${n.toString(16).padStart(6, "0")}`;
+}
+
+function isExcludedRole(role, guildId) {
+  if (!role || role.id == null || role.id === "") return true;
+  if (String(role.id) === String(guildId)) return true;
+  if (role.name === "@everyone") return true;
+  // Managed bot roles carry tags.bot_id. The Server Booster role is managed too,
+  // but its tag is premium_subscriber and it does not have bot_id, so it stays.
+  if (role.tags && role.tags.bot_id) return true;
+  return false;
+}
+
+async function listDiscordRoles() {
+  const url = `${DISCORD_API}/guilds/${DISCORD_GUILD_ID}/roles`;
+  const response = await request(
+    url,
+    {
+      headers: {
+        Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+        "User-Agent": USER_AGENT,
+      },
+    },
+    { label: "Discord role list" }
+  );
+  const body = await readBody(response);
+
+  if (response.status === 401) {
+    fail("Discord rejected the bot token (401). Check the DISCORD_BOT_TOKEN secret.");
+  }
+  if (response.status === 403) {
+    fail("Discord rejected the role list (403). Check that the bot is still in the server.");
+  }
+  if (!response.ok) {
+    fail(`Discord role list failed (${response.status}).`, bodySnippet(body));
+  }
+  if (!Array.isArray(body.json)) {
+    fail("Discord role list returned an unexpected response.");
+  }
+
+  const roles = {};
+  let excluded = 0;
+  for (const role of body.json) {
+    if (isExcludedRole(role, DISCORD_GUILD_ID)) {
+      excluded += 1;
+      continue;
+    }
+    const id = String(role.id);
+    const position = Number(role.position);
+    roles[id] = {
+      name: String(role.name ?? ""),
+      color: colorToHex(role.color),
+      position: Number.isFinite(position) ? Math.trunc(position) : 0,
+    };
+  }
+
+  const kept = Object.keys(roles).length;
+  log(`Discord: ${kept} role${kept === 1 ? "" : "s"} kept, ${excluded} excluded.`);
+  return roles;
 }
 
 function parseRobloxId(value) {
@@ -335,17 +411,69 @@ async function putDatastoreEntry(entryId, value) {
   }
 }
 
+function sortObject(map) {
+  const out = {};
+  for (const key of Object.keys(map).sort()) out[key] = map[key];
+  return out;
+}
+
 function normalizeCache(value) {
-  const map = {};
+  const positive = {};
+  const negativeUntil = {};
+  if (!value || typeof value !== "object") return { positive, negativeUntil };
+
   const source =
-    value && typeof value === "object" && value.discordToRoblox && typeof value.discordToRoblox === "object"
-      ? value.discordToRoblox
-      : {};
+    value.discordToRoblox && typeof value.discordToRoblox === "object" ? value.discordToRoblox : {};
   for (const [discordId, robloxId] of Object.entries(source)) {
     const parsed = parseRobloxId(robloxId);
-    if (discordId && parsed) map[String(discordId)] = parsed;
+    if (discordId && parsed) positive[String(discordId)] = parsed;
   }
-  return map;
+
+  const negatives =
+    value.negativeLookups && typeof value.negativeLookups === "object" ? value.negativeLookups : {};
+  const now = Date.now();
+  for (const [discordId, expiresAt] of Object.entries(negatives)) {
+    const when = typeof expiresAt === "number" ? expiresAt : Date.parse(String(expiresAt));
+    if (discordId && Number.isFinite(when) && when > now) negativeUntil[String(discordId)] = when;
+  }
+  return { positive, negativeUntil };
+}
+
+function cacheRecord(positive, negativeUntil) {
+  const negativeLookups = {};
+  for (const id of Object.keys(negativeUntil).sort()) {
+    negativeLookups[id] = new Date(negativeUntil[id]).toISOString();
+  }
+  const record = { discordToRoblox: sortObject(positive) };
+  if (Object.keys(negativeLookups).length > 0) record.negativeLookups = negativeLookups;
+  return record;
+}
+
+function canonicalStoredCache(value) {
+  const positive = {};
+  const negativeLookups = {};
+  if (value && typeof value === "object") {
+    const source =
+      value.discordToRoblox && typeof value.discordToRoblox === "object" ? value.discordToRoblox : {};
+    for (const [discordId, robloxId] of Object.entries(source)) {
+      const parsed = parseRobloxId(robloxId);
+      if (discordId && parsed) positive[String(discordId)] = parsed;
+    }
+    const negatives =
+      value.negativeLookups && typeof value.negativeLookups === "object" ? value.negativeLookups : {};
+    for (const [discordId, expiresAt] of Object.entries(negatives)) {
+      const when = typeof expiresAt === "number" ? expiresAt : Date.parse(String(expiresAt));
+      if (discordId && Number.isFinite(when)) negativeLookups[String(discordId)] = new Date(when).toISOString();
+    }
+  }
+  const record = { discordToRoblox: sortObject(positive) };
+  const sortedNeg = sortObject(negativeLookups);
+  if (Object.keys(sortedNeg).length > 0) record.negativeLookups = sortedNeg;
+  return record;
+}
+
+function cacheChanged(previousValue, positive, negativeUntil) {
+  return JSON.stringify(canonicalStoredCache(previousValue)) !== JSON.stringify(cacheRecord(positive, negativeUntil));
 }
 
 function currentBoosterList(value) {
@@ -370,83 +498,236 @@ function compareKey(list) {
   );
 }
 
-async function resolveBoosters(discordBoosters, cache) {
-  const resolved = [];
-  const nextCache = { ...cache };
-  let lookedUp = 0;
-  let reused = 0;
-  let skipped = 0;
-
-  for (const booster of discordBoosters) {
-    let robloxId = nextCache[booster.discordId] || null;
-    if (robloxId) {
-      reused += 1;
-    } else {
-      // Small delay so a sudden jump in booster count does not burst the API.
-      if (lookedUp > 0) await sleep(200);
-      robloxId = await lookupRobloxId(booster.discordId);
-      lookedUp += 1;
-      if (robloxId) {
-        nextCache[booster.discordId] = robloxId;
-      } else {
-        skipped += 1;
-        continue;
-      }
-    }
-    resolved.push({
-      robloxId,
-      since: booster.since,
-    });
+function collectDiscordIds(members, boosters, roleMap) {
+  const ids = new Set();
+  for (const booster of boosters) ids.add(booster.discordId);
+  for (const member of members) {
+    if (member.roleIds.some((roleId) => Object.hasOwn(roleMap, roleId))) ids.add(member.discordId);
   }
-
-  // Drop cache entries for people who are no longer boosting so the cache stays small.
-  const active = new Set(discordBoosters.map((row) => row.discordId));
-  for (const discordId of Object.keys(nextCache)) {
-    if (!active.has(discordId)) delete nextCache[discordId];
-  }
-
-  log(
-    `Bloxlink: ${lookedUp} lookup${lookedUp === 1 ? "" : "s"}, ${reused} reused from cache, ${skipped} unlinked skipped, ${resolved.length} linked booster${resolved.length === 1 ? "" : "s"}.`
-  );
-  return { resolved, nextCache };
+  return [...ids].sort();
 }
 
-function cacheChanged(previous, next) {
-  return JSON.stringify(previous) !== JSON.stringify(next);
+async function resolveDiscordIds(discordIds, cache) {
+  const positive = { ...cache.positive };
+  const negativeUntil = { ...cache.negativeUntil };
+  let lookedUp = 0;
+  let reused = 0;
+  let negativeHits = 0;
+  let unlinked = 0;
+  const now = Date.now();
+
+  for (const discordId of discordIds) {
+    if (positive[discordId]) {
+      delete negativeUntil[discordId];
+      reused += 1;
+      continue;
+    }
+    if (negativeUntil[discordId] && negativeUntil[discordId] > now) {
+      negativeHits += 1;
+      continue;
+    }
+    // Small delay so a sudden jump in lookups does not burst the API.
+    if (lookedUp > 0) await sleep(LOOKUP_GAP_MS);
+    const robloxId = await lookupRobloxId(discordId);
+    lookedUp += 1;
+    if (robloxId) {
+      positive[discordId] = robloxId;
+      delete negativeUntil[discordId];
+    } else {
+      delete positive[discordId];
+      negativeUntil[discordId] = Date.now() + NEGATIVE_LOOKUP_TTL_MS;
+      unlinked += 1;
+    }
+  }
+
+  return { positive, negativeUntil, lookedUp, reused, negativeHits, unlinked };
+}
+
+function pruneCache(positive, negativeUntil, activeIds) {
+  const active = new Set(activeIds);
+  const now = Date.now();
+  for (const discordId of Object.keys(positive)) {
+    if (!active.has(discordId)) delete positive[discordId];
+  }
+  for (const discordId of Object.keys(negativeUntil)) {
+    if (!active.has(discordId) || negativeUntil[discordId] <= now) delete negativeUntil[discordId];
+  }
+}
+
+function linkedBoosters(boosters, positive) {
+  const resolved = [];
+  for (const booster of boosters) {
+    const robloxId = positive[booster.discordId];
+    if (!robloxId) continue;
+    resolved.push({ robloxId, since: booster.since });
+  }
+  return resolved;
+}
+
+function compareRoleIds(roleMap, a, b) {
+  const pa = roleMap[a] ? roleMap[a].position : 0;
+  const pb = roleMap[b] ? roleMap[b].position : 0;
+  if (pa !== pb) return pb - pa;
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+function buildRolesPayload(roleMap, members, positive) {
+  const roles = {};
+  for (const id of Object.keys(roleMap).sort((a, b) => compareRoleIds(roleMap, a, b))) {
+    roles[id] = roleMap[id];
+  }
+
+  const grouped = {};
+  for (const member of members) {
+    const robloxId = positive[member.discordId];
+    if (!robloxId) continue;
+    const kept = member.roleIds.filter((roleId) => Object.hasOwn(roleMap, roleId));
+    if (kept.length === 0) continue;
+    const key = String(robloxId);
+    if (!grouped[key]) grouped[key] = new Set();
+    for (const roleId of kept) grouped[key].add(roleId);
+  }
+
+  const membersOut = {};
+  for (const id of Object.keys(grouped).sort((a, b) => Number(a) - Number(b))) {
+    membersOut[id] = [...grouped[id]].sort((a, b) => compareRoleIds(roleMap, a, b));
+  }
+
+  return {
+    updatedAt: new Date().toISOString(),
+    roles,
+    members: membersOut,
+  };
+}
+
+function rolesSignature(value) {
+  const roles =
+    value && typeof value === "object" && value.roles && typeof value.roles === "object" ? value.roles : {};
+  const members =
+    value && typeof value === "object" && value.members && typeof value.members === "object" ? value.members : {};
+  const rolePart = Object.keys(roles)
+    .sort()
+    .map((id) => {
+      const role = roles[id] && typeof roles[id] === "object" ? roles[id] : {};
+      const position = Number(role.position);
+      return [String(id), String(role.name ?? ""), String(role.color ?? ""), Number.isFinite(position) ? position : 0];
+    });
+  const memberPart = Object.keys(members)
+    .sort()
+    .map((id) => {
+      const list = Array.isArray(members[id]) ? members[id].map((roleId) => String(roleId)).sort() : [];
+      return [String(id), list];
+    });
+  return JSON.stringify([rolePart, memberPart]);
+}
+
+function datastoreValueBytes(value) {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+function assertDatastoreLimit(value, label) {
+  const bytes = datastoreValueBytes(value);
+  if (bytes > DATASTORE_VALUE_LIMIT_BYTES) {
+    fail(
+      `${label} is ${bytes} bytes, which is over the Roblox datastore limit of ${DATASTORE_VALUE_LIMIT_BYTES} bytes (4MB). ` +
+        "Refusing to write so the existing entry stays intact."
+    );
+  }
+  if (bytes > Math.floor(DATASTORE_VALUE_LIMIT_BYTES * 0.75)) {
+    log(`${label} is ${bytes} bytes, over 75% of the 4MB datastore limit.`);
+  }
+  return bytes;
 }
 
 async function main() {
   requireSecrets();
 
-  const discordBoosters = await listDiscordBoosters();
+  const { members, boosters } = await listDiscordGuild();
+  const roleMap = await listDiscordRoles();
   const current = await getDatastoreEntry(BOOSTERS_KEY);
   const cacheEntry = await getDatastoreEntry(CACHE_KEY);
+  const rolesEntry = await getDatastoreEntry(ROLES_KEY);
   const cache = normalizeCache(cacheEntry.value);
+  const discordIds = collectDiscordIds(members, boosters, roleMap);
+  const stats = await resolveDiscordIds(discordIds, cache);
+  pruneCache(stats.positive, stats.negativeUntil, discordIds);
 
-  const { resolved, nextCache } = await resolveBoosters(discordBoosters, cache);
-  const previous = currentBoosterList(current.value);
-  const sameList = compareKey(previous) === compareKey(resolved);
+  const resolved = linkedBoosters(boosters, stats.positive);
+  log(
+    `Bloxlink: ${stats.lookedUp} lookup${stats.lookedUp === 1 ? "" : "s"}, ` +
+      `${stats.reused} reused from cache, ` +
+      `${stats.negativeHits} unlinked cache hit${stats.negativeHits === 1 ? "" : "s"}, ` +
+      `${stats.unlinked} unlinked skipped, ` +
+      `${resolved.length} linked booster${resolved.length === 1 ? "" : "s"}.`
+  );
 
-  if (cacheChanged(cache, nextCache)) {
-    await putDatastoreEntry(CACHE_KEY, { discordToRoblox: nextCache });
+  if (cacheChanged(cacheEntry.value, stats.positive, stats.negativeUntil)) {
+    await putDatastoreEntry(CACHE_KEY, cacheRecord(stats.positive, stats.negativeUntil));
     log("Datastore: lookup cache updated.");
   }
 
+  const previous = currentBoosterList(current.value);
+  const sameList = compareKey(previous) === compareKey(resolved);
   if (sameList && !current.missing) {
     log("Datastore: booster list unchanged, no write.");
+  } else {
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      boosters: resolved
+        .slice()
+        .sort((a, b) => String(a.since).localeCompare(String(b.since)) || a.robloxId - b.robloxId),
+    };
+    await putDatastoreEntry(BOOSTERS_KEY, payload);
+    log(
+      `Datastore: wrote ${payload.boosters.length} booster${payload.boosters.length === 1 ? "" : "s"} to ${DATASTORE_NAME}/${BOOSTERS_KEY}.`
+    );
+  }
+
+  const rolesPayload = buildRolesPayload(roleMap, members, stats.positive);
+  const roleCount = Object.keys(rolesPayload.roles).length;
+  const memberCount = Object.keys(rolesPayload.members).length;
+  const sameRoles = rolesSignature(rolesEntry.value) === rolesSignature(rolesPayload);
+  if (sameRoles && !rolesEntry.missing) {
+    const bytes = datastoreValueBytes(rolesPayload);
+    if (bytes > DATASTORE_VALUE_LIMIT_BYTES) {
+      log(
+        `Datastore: Discord roles unchanged, but the entry is ${bytes} bytes, over the 4MB datastore limit.`
+      );
+    } else {
+      log(
+        `Datastore: Discord roles unchanged, no write (${roleCount} roles, ${memberCount} linked members, ${bytes} bytes).`
+      );
+    }
     return;
   }
 
-  const payload = {
-    updatedAt: new Date().toISOString(),
-    boosters: resolved
-      .slice()
-      .sort((a, b) => String(a.since).localeCompare(String(b.since)) || a.robloxId - b.robloxId),
-  };
-  await putDatastoreEntry(BOOSTERS_KEY, payload);
-  log(`Datastore: wrote ${payload.boosters.length} booster${payload.boosters.length === 1 ? "" : "s"} to ${DATASTORE_NAME}/${BOOSTERS_KEY}.`);
+  const bytes = assertDatastoreLimit(rolesPayload, "Discord roles entry");
+  await putDatastoreEntry(ROLES_KEY, rolesPayload);
+  log(
+    `Datastore: wrote ${roleCount} role${roleCount === 1 ? "" : "s"} and ${memberCount} linked member${memberCount === 1 ? "" : "s"} to ${DATASTORE_NAME}/${ROLES_KEY} (${bytes} bytes).`
+  );
 }
 
-main().catch((error) => {
-  fail(error && error.message ? error.message : "Unexpected failure.");
-});
+if (require.main === module) {
+  main().catch((error) => {
+    fail(error && error.message ? error.message : "Unexpected failure.");
+  });
+}
+
+module.exports = {
+  colorToHex,
+  isExcludedRole,
+  normalizeCache,
+  cacheRecord,
+  cacheChanged,
+  collectDiscordIds,
+  pruneCache,
+  linkedBoosters,
+  buildRolesPayload,
+  rolesSignature,
+  datastoreValueBytes,
+  DATASTORE_VALUE_LIMIT_BYTES,
+  NEGATIVE_LOOKUP_TTL_MS,
+};
