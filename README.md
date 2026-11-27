@@ -103,7 +103,7 @@ Studio playtest after the first successful workflow run. A linked booster should
 ## Notes
 
 - GitHub scheduled runs can be a few minutes late. They are also not exact to the second.
-- Lookups are cached in the datastore key `lookup-cache`. A linked Discord account is reused on later runs. An account Bloxlink does not know is remembered for 24 hours (`negativeLookups`), so unlinked members are not queried again every run. After that, the next run tries once. The cache covers boosters and members who have a synced role.
+- Lookups are cached in the datastore key `lookup-cache`. A linked Discord account is reused on later runs. An account Bloxlink does not know is remembered for 24 hours (`negativeLookups`), so unlinked members are not queried again every run. After that, the next run tries once. The cache covers boosters and every human member of the server.
 - Discord roles use the same `SupporterWall` datastore, key `roles`, so the Open Cloud key can stay limited to that one datastore. The `boosters` entry is a separate value and is not changed by the role write. The `roles` value looks like:
 
   ```json
@@ -118,8 +118,14 @@ Studio playtest after the first successful workflow run. A linked booster should
   }
   ```
 
-  `color` is `#rrggbb`. Discord's default color is `#000000`. `position` is the Discord role position (higher is higher in the list). `members` lists only people Bloxlink could link, and each array is that account's role ids, highest position first. `@everyone` and managed bot roles (`tags.bot_id`) are left out. The Server Booster role (`tags.premium_subscriber`) is included. The sync will not write this entry if its JSON is larger than 4MB (4,194,304 bytes). With the current server size that is a long way off.
+  `color` is `#rrggbb`. Discord's default color is `#000000`. `position` is the Discord role position (higher is higher in the list). `members` lists only people Bloxlink could link. Each array is that account's synced role ids, highest position first. A linked member who only has `@everyone` is still listed, with an empty array, so the game can tell they are in the Discord (used by the join reward). `@everyone` and managed bot roles (`tags.bot_id`) are left out of `roles` and of those arrays. The Server Booster role (`tags.premium_subscriber`) is included. The sync will not write this entry if its JSON is larger than 4MB (4,194,304 bytes). With the current server size that is a long way off.
 - Private GitHub repos on the free plan get **2,000 Actions minutes per month**. This repo runs every **30 minutes** (about 1,440 runs and minutes a month), which fits the free private cap. Every 10 minutes would be about 4,300 minutes, which goes over it. Safer options:
   - Make the repo **public** (standard GitHub-hosted runs on public repos do not use that 2,000-minute cap), or
   - Run less often. Every **15 minutes** is still about 2,880 minutes, so it can still go over. Every **30 minutes** is about 1,440 minutes and fits comfortably.
 - To change the schedule, edit `.github/workflows/sync.yml` and change the cron line (for example `'*/30 * * * *'`).
+
+## Discord join reward
+
+The `roles.members` map is also how Overgrowth tells whether a Roblox account is a linked Monovault member. A one-time join reward (1 cosmetic, 250 Samples, 3 emotes) is handled in the game by `JoinReward.server.lua` (see the join-reward package, not this repo's Roblox folder). The claimed flag is a separate datastore, `JoinReward`, so leaving the Discord later does not take the reward away.
+
+The 30-minute Action is enough if players can wait and press Recheck. For a near-instant grant after they join and verify, the Monovault Ops bot can write the same `roles` and `lookup-cache` entries (and optionally publish a MessagingService topic). That also bypasses the 24-hour unlinked cache when someone verifies after a run already recorded them as unlinked.

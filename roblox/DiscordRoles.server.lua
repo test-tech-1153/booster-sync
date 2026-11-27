@@ -21,6 +21,9 @@
 -- Other server scripts can call:
 --   ServerStorage.GetDiscordRoles:Invoke(player)
 -- which returns { { name, color, position }, ... } in that same order.
+--   ServerStorage.IsMonovaultMember:Invoke(player)
+-- which is true when that Roblox account is in the roles.members map,
+-- even if the role list is empty (linked, but only @everyone).
 
 local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
@@ -145,6 +148,21 @@ local function getDiscordRoles(player)
 	return copyRoleList(rolesForUser(player.UserId))
 end
 
+local function isMonovaultMember(player)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then
+		return false
+	end
+	local key = tostring(player.UserId)
+	if snapshot.members[key] ~= nil then
+		return true
+	end
+	-- numeric keys, in case a datastore value was decoded that way
+	if typeof(player.UserId) == "number" and snapshot.members[player.UserId] ~= nil then
+		return true
+	end
+	return false
+end
+
 local function refresh()
 	if refreshRunning then
 		while refreshRunning do
@@ -178,6 +196,18 @@ if not checkFn then
 	checkFn.Parent = ServerStorage
 end
 checkFn.OnInvoke = getDiscordRoles
+
+local memberFn = ServerStorage:FindFirstChild("IsMonovaultMember")
+if memberFn and not memberFn:IsA("BindableFunction") then
+	memberFn:Destroy()
+	memberFn = nil
+end
+if not memberFn then
+	memberFn = Instance.new("BindableFunction")
+	memberFn.Name = "IsMonovaultMember"
+	memberFn.Parent = ServerStorage
+end
+memberFn.OnInvoke = isMonovaultMember
 
 local function onPlayer(player)
 	refresh()

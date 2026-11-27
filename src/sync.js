@@ -4,7 +4,8 @@
  * Monovault booster sync
  *
  * Reads Discord boosters and server roles in the live guild, looks up each
- * linked Roblox account through Bloxlink, and writes the lists to a Roblox
+ * linked Roblox account through Bloxlink (every human member, not only
+ * boosters or people with a synced role), and writes the lists to a Roblox
  * datastore when they have changed.
  *
  * Secrets come from the environment. This script never prints them.
@@ -499,11 +500,13 @@ function compareKey(list) {
 }
 
 function collectDiscordIds(members, boosters, roleMap) {
+  // Look up every human member, including people who only have @everyone.
+  // Join-reward checks membership by Roblox user id in the roles.members map,
+  // so those accounts have to be resolved even when they have no synced role.
+  // roleMap is unused and kept so existing callers stay compatible.
   const ids = new Set();
   for (const booster of boosters) ids.add(booster.discordId);
-  for (const member of members) {
-    if (member.roleIds.some((roleId) => Object.hasOwn(roleMap, roleId))) ids.add(member.discordId);
-  }
+  for (const member of members) ids.add(member.discordId);
   return [...ids].sort();
 }
 
@@ -584,7 +587,8 @@ function buildRolesPayload(roleMap, members, positive) {
     const robloxId = positive[member.discordId];
     if (!robloxId) continue;
     const kept = member.roleIds.filter((roleId) => Object.hasOwn(roleMap, roleId));
-    if (kept.length === 0) continue;
+    // Include every linked member, even when kept is empty (only @everyone).
+    // Join-reward treats a key in members as "this Roblox account is in the Discord."
     const key = String(robloxId);
     if (!grouped[key]) grouped[key] = new Set();
     for (const roleId of kept) grouped[key].add(roleId);
